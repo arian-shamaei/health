@@ -71,7 +71,7 @@ Uninstall: `rm ~/.local/bin/health ~/.local/share/man/man1/health.1`. Nothing el
 health            the figure alone, as large as the window, about 10 frames a second; q quits
 health 4          4 frames a second (0.5 to 20; fewer over a slow link)
 health --braille  Braille dots instead of pixels, on any terminal
-health --once     one drawing with the readings beside it (a login screen: instant, no animation)
+health --once     one drawing with the readings (a login screen: instant, no animation)
 health --png out.png [--readings temp=73,load=4.7,mem=0.6,disk=0.8,hour=14]
                   one frame to a PNG, from the readings now or as pinned
 health --demo DIR frames of a scripted build, for a GIF of the renderer
@@ -83,7 +83,7 @@ A frame costs a Raspberry Pi 5 about 30 ms (the trace turns unit phasors by a co
 
 ### As a login screen
 
-`health --once` is the form it was born in: the figure in Braille beside the raw readings, done in well under a tenth of a second, no pixels, nothing animates. Put it in `~/.bash_profile` behind an interactive-shell check and every login is a glance at the machine.
+`health --once` is the form it was born in: one drawing with the raw readings, done in well under a tenth of a second, nothing animates. On a terminal that draws pixels it is one frame of the live view, sixteen rows tall, with the readings below it; anywhere else (or with `--braille`) the figure is Braille with the readings beside it. Put it in `~/.bash_profile` behind an interactive-shell check and every login is a glance at the machine. Over ssh the terminal is known from `TERM` (Ghostty and kitty name themselves there) or from `TERM_PROGRAM` when the client sends it (`SendEnv TERM_PROGRAM` in `~/.ssh/config`, `AcceptEnv TERM_PROGRAM` on the server), which is also how a login from inside tmux is recognised.
 
 ## Readings
 
