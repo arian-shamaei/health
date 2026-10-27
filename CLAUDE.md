@@ -1,0 +1,19 @@
+# health
+
+One-file Python program (`health`, standard library only) that draws a machine's health as
+a live harmonograph in the terminal. Public repo: https://github.com/arian-shamaei/health.
+
+- `health` is the whole program: readings, curve, Braille and PNG renderers, the terminal
+  protocols (Kitty with Unicode placeholders through tmux, iTerm2, sixel through chafa),
+  the live loop, `--once`, `--png`, `--demo`. Its docstring is the mapping's documentation.
+- `health.1` is the man page; `install.sh` the curl installer; `docs/render.sh` regenerates
+  `docs/assets/` from the tool (the hero is a real screenshot, kept as is).
+- Origin: `~/Developer/cat/pi/rawr/harmonograph.py` on the Raspberry Pi account `rawr`.
+  This repo is the standalone form; the Pi's login screen still runs the original.
+- Rules: no dependencies, Python 3.7 syntax (the Mac's python3 is 3.9), every figure in the
+  README comes from the renderer or a real screenshot, never a mock. A change to the mapping
+  is a change to the docstring, the README table and the man page in the same commit.
+- Verify the live loop without a window: `/tmp/ptytest.py`-style, a `pty.fork` that sends
+  `q` after two seconds and checks for the alternate-screen sequences and the protocol's
+  marker (`\x1b_Ga=T`, `1337;File`, Braille). On Linux the master read ends with EIO, not
+  EOF.

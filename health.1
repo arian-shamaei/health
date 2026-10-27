@@ -1,0 +1,128 @@
+.TH HEALTH 1 "2026-10-27" "health 0.1.0" "health"
+.SH NAME
+health \- the machine's health as a harmonograph, live in the terminal
+.SH SYNOPSIS
+.B health
+.RI [ fps ]
+.RB [ \-\-braille ]
+.br
+.B health \-\-once
+.RB [ \-\-no\-legend ]
+.RB [ \-\-cols
+.IR N ]
+.br
+.B health \-\-png
+.I path
+.RB [ \-\-size
+.IR WxH ]
+.RB [ \-\-readings
+.IR spec ]
+.br
+.B health \-\-demo
+.I dir
+.RB [ \-\-fps
+.IR N ]
+.RB [ \-\-size
+.IR WxH ]
+.RB [ \-\-seconds
+.IR N ]
+.br
+.B health \-h
+|
+.B \-\-help
+|
+.B \-\-version
+.SH DESCRIPTION
+.B health
+draws the trace of a damped two-pendulum harmonograph, as large as the window, with one
+muted line of readings under it, on its own screen. It turns continuously and is redrawn
+from fresh readings about
+.I fps
+times a second (default 10), so it can be watched answering the machine: start a build and
+the trace spirals in and warms in colour; let it idle and the figure locks again. Press
+.B q
+to leave; the previous screen comes back untouched.
+.PP
+The figure is a Lissajous curve. Two pendulums, one for X and one for Y, locked at a simple
+ratio, draw one closed curve that stands still: the idle machine. Every reading is a
+departure from that picture, zero at idle: the cpu temperature detunes the ratio (the
+figure precesses and fills in) and sets the hue, blue at 35 C to red at 80 C; the load per
+core damps it (each lap smaller); the memory in use adds a wobble; the disk used spreads
+the colour along the trace, one hue when empty, the whole wheel when full. The hour of day
+picks the ratio and the uptime turns the figure slowly; those two are the clock, not
+health.
+.PP
+The readings reach the figure with inertia: temperature and memory over about three
+seconds, load over two, and the hour's ratio over about a minute, so the figure never
+shivers with the sensor and glides from one family to the next. The line under the figure
+shows the raw readings.
+.PP
+On a terminal that draws pixels the frame is a PNG sent over the Kitty graphics protocol
+(Ghostty, kitty, WezTerm, also through tmux with
+.B allow-passthrough on
+), the iTerm2 inline-image protocol, or as sixels through
+.BR chafa (1)
+when it is installed. Anywhere else, or with
+.BR \-\-braille ,
+the trace is Braille dots in 24-bit colour.
+.SH OPTIONS
+.TP
+.I fps
+Frames a second, 0.5 to 20. A Raspberry Pi 5 renders a frame in about 30 ms; over a slow
+link a lower rate is smoother.
+.TP
+.B \-\-braille
+Braille dots instead of pixels, whatever the terminal.
+.TP
+.B \-\-once
+One drawing from the readings now, in Braille, with the readings beside it: user and host,
+uptime, ip, cpu temperature, load, memory, disk, kernel. Instant, no pixels, no animation;
+the form for a login screen.
+.B \-\-no\-legend
+leaves out the readings,
+.BI \-\-cols " N"
+sets the width instead of asking the terminal.
+.TP
+.BI \-\-png " path"
+One frame to a PNG (default 1200x600, set with
+.BR \-\-size ),
+from the readings now or as pinned with
+.BR \-\-readings ,
+a comma-separated list such as
+.BR temp=73,load=4.7,mem=0.6,disk=0.8,hour=14 :
+temperature in C, load average, memory and disk as fractions used, the hour.
+.TP
+.BI \-\-demo " dir"
+Frames of a scripted scenario (a build starts, runs, and the machine cools; eighteen
+seconds) through the live view's own frame maker, as
+.I frame-NNNN.png
+with the readings in
+.IR frame-NNNN.txt ,
+for a GIF of the renderer.
+.BR \-\-fps ,
+.B \-\-size
+and
+.B \-\-seconds
+set the rate, the frame and the length.
+.SH ENVIRONMENT
+.TP
+.B HEALTH_FORMAT
+.BR kitty ", " iterm " or " sixels
+forces the pixel protocol; anything else forces Braille.
+.TP
+.B HEALTH_DEBUG
+Set to log the terminal's replies and each frame's size on stderr.
+.TP
+.B TMPDIR
+Where the one temporary PNG per frame is written (default
+.IR /tmp ),
+removed on exit.
+.SH FILES
+None. Nothing is written outside
+.BR TMPDIR .
+.SH SEE ALSO
+.BR chafa (1),
+.BR htop (1),
+.BR uptime (1).
+.PP
+https://github.com/arian-shamaei/health

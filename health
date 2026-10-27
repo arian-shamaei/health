@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""health: the machine's health as a harmonograph, live in the terminal.
+
+One Python file, standard library only. Every frame draws the trace of a damped
+two-pendulum harmonograph whose frequencies, phases, damping and colours are set by the
+machine's readings at that moment, as large as the window, redrawn about ten times a
+second until q.
+
+How the readings set the curve (documented here, deliberately not on screen). The
+picture is the one on an oscilloscope in X-Y mode: one pendulum drives X, the other Y.
+Two signals locked at a simple ratio, at a fixed phase, with no loss, draw one closed
+Lissajous curve that stands still and retraces itself. That is the idle machine. Every
+reading is a departure from that picture, each in its own way, and every departure is
+zero when the reading is at idle:
+
+    hour of day       which locked ratio (2:3, 3:4, 3:5, 4:5, 5:6, 5:7): the family of
+                      the figure; the clock rather than health
+    uptime            the phase between X and Y: the figure turns slowly as the machine
+                      runs; the clock rather than health
+    cpu temperature   detuning: the ratio slips, the figure precesses and fills in
+                      (35 C locked, 80 C a slip of 2.5 rad over the trace, squared so a
+                      warm machine barely slips); and the hue, 35 C blue to 80 C red
+    load per core     damping: each lap smaller, the figure spirals in (idle retraces
+                      itself; at one load per core the last lap is 40 %)
+    memory in use     the second pendulum: a wobble riding on the clean curve (none at
+                      0 %, as large as the main term at 100 %)
+    disk used         the colour spread along the trace: one hue when the disk is
+                      empty, the whole wheel when it is full
+    user@host         seed of the fine phases, stable per account
+    second            phase of the wobble
+
+So a quiet machine draws one closed figure in one cool colour, and a stressed machine a
+drifting, shrinking, wobbling tangle across the whole wheel.
+
+The readings reach the figure with inertia (temperature and memory over about three
+seconds, load over two, the hour's ratio over about a minute), so the figure never
+shivers with the sensor and glides from one family to the next.
+
+On a terminal that draws pixels the frame is a PNG (rendered here, no library) sent over
+the Kitty graphics protocol (Ghostty, kitty, WezTerm, also through tmux) or the iTerm2
+inline-image protocol, or as sixels through `chafa` when it is installed (Windows
+Terminal, foot, mlterm). Anywhere else, or with --braille, the trace is Braille dots.
+
+Usage: health [FPS] [--braille] [--once] [--png PATH] [--demo DIR] ...; see --help.
+"""
+import base64
+import fcntl
+import math
+import os
+import random
+import re
+import select
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+import zlib
+
+VERSION = "0.1.0"
+
+# ---------------------------------------------------------------- readings
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def sysctl(name):
+    try:
+        out = subprocess.run(["sysctl", "-n", name], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=1).stdout.decode().strip()
+        return out
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def read_temp_c():
+    """The cpu temperature in C: the first thermal zone on Linux; none means idle (35 C)."""
+    for zone in ("thermal_zone0", "thermal_zone1"):
+        s = read_file("/sys/class/thermal/%s/temp" % zone).strip()
+        if s:
+            try:
+                return int(s) / 1000.0
+            except ValueError:
+                pass
+    for root, _, files in os.walk("/sys/class/hwmon"):
+        for name in files:
+            if name.startswith("temp") and name.endswith("_input"):
+                s = read_file(os.path.join(root, name)).strip()
+                if s:
+                    try:
+                        return int(s) / 1000.0
+                    except ValueError:
+                        pass
+        break
+    return 35.0
+
+
+def read_load():
+    try:
+        return os.getloadavg()[0]
+    except OSError:
+        return 0.0
+
+
+def read_uptime_s():
+    s = read_file("/proc/uptime").split()
+    if s:
+        return float(s[0])
+    m = re.search(r"sec\s*=\s*(\d+)", sysctl("kern.boottime"))      # macOS, BSD
+    if m:
+        return max(0.0, time.time() - int(m.group(1)))
+    return 0.0
+
+
+def read_mem_mb():
+    """(used, total) in MB, used = total - available."""
+    vals = {}
+    for line in read_file("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        if v:
+            vals[k] = int(v.split()[0])
+    if "MemTotal" in vals and "MemAvailable" in vals:
+        t = vals["MemTotal"] // 1024
+        return t - vals["MemAvailable"] // 1024, t
+    total = sysctl("hw.memsize")                                       # macOS
+    if total.isdigit():
+        t = int(total) // (1024 * 1024)
+        try:
+            vm = subprocess.run(["vm_stat"], stdout=subprocess.PIPE, timeout=1).stdout.decode()
+            page = int(re.search(r"page size of (\d+)", vm).group(1))
+            free = 0
+            for key in ("Pages free", "Pages inactive", "Pages speculative"):
+                m = re.search(key + r":\s*(\d+)", vm)
+                if m:
+                    free += int(m.group(1))
+            return t - free * page // (1024 * 1024), t
+        except (OSError, subprocess.SubprocessError, AttributeError, ValueError):
+            return t // 2, t
+    return 400, 8000
+
+
+def read_disk():
+    """(free GB, free fraction) of /."""
+    try:
+        st = os.statvfs("/")
+        return st.f_bavail * st.f_frsize / 1e9, st.f_bavail / max(1, st.f_blocks)
+    except OSError:
+        return 0.0, 0.5
+
+
+def read_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))   # no packet is sent; picks the route
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return ""
+
+
+def gather():
+    now = time.localtime()
+    used, total = read_mem_mb()
+    free_gb, free_frac = read_disk()
+    return {
+        "temp": read_temp_c(),
+        "load": read_load(),
+        "uptime": read_uptime_s(),
+        "mem_used": used, "mem_total": total,
+        "disk_free_gb": free_gb, "disk_free_frac": free_frac,
+        "hour": now.tm_hour, "sec": now.tm_sec,
+        "user": os.environ.get("USER") or os.environ.get("LOGNAME") or "someone",
+        "host": socket.gethostname().split(".")[0],
+        "ip": read_ip(),
+        "kernel": os.uname().release,
+        "stamp": time.strftime("%a %Y-%m-%d %H:%M", now),
+    }
+
+
+# ---------------------------------------------------------------- the curve
+
+RATIOS = [(2, 3), (3, 4), (3, 5), (4, 5), (5, 6), (5, 7)]
+
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def params(r, ratio=None):
+    """The curve's parameters from the readings. `ratio` overrides the hour's (fa, fb), as
+    floats, for the live view gliding from one hour block's ratio to the next."""
+    heat = clamp((r["temp"] - 35.0) / 45.0, 0.0, 1.0)                     # 35 C idle, 80 C throttling
+    busy = clamp(r["load"] / max(1, os.cpu_count() or 1), 0.0, 1.0)       # load per core
+    mem = clamp(r["mem_used"] / max(1, r["mem_total"]), 0.0, 1.0)
+    full = clamp(1.0 - r["disk_free_frac"], 0.0, 1.0)
+    fa, fb = ratio or RATIOS[(r["hour"] // 4) % len(RATIOS)]
+    t_end = 2 * math.pi * 10 / fa                 # ten periods of the slower pendulum
+    detune = 2.5 * heat * heat / t_end             # the ratio slips 0 (locked) to 2.5 rad over the trace
+    seed = zlib.crc32(("%s@%s" % (r["user"], r["host"])).encode())
+    s1 = (seed & 0xFF) / 255.0 * 2 * math.pi
+    s2 = ((seed >> 8) & 0xFF) / 255.0 * 2 * math.pi
+    up_min = r["uptime"] / 60.0
+    return {
+        "fx1": fa, "fy1": fb + detune,
+        "fx2": fa + 1 + detune * 3, "fy2": fb + 1,
+        "px1": math.radians(up_min % 360) + s1,
+        "py1": math.radians((up_min * 0.7) % 360) + s2,
+        "px2": 2 * math.pi * r["sec"] / 60.0,
+        "py2": 2 * math.pi * r["sec"] / 60.0 + math.pi / 2,
+        "amp2": mem,                                            # 0: pure Lissajous, 1: wobble as big as the curve
+        "damp": -math.log(1.0 - 0.6 * busy) / t_end,            # last lap 100 % (idle) to 40 % (one load per core)
+        "t_end": t_end,
+        "base_hue": 240.0 * (1.0 - heat),                       # blue to red
+        "sweep": 20.0 + 300.0 * full,                           # one hue to the whole wheel
+    }
+
+
+def trace(p, n=14000):
+    """Points (x, y, u) with x, y in [-1, 1] and u in [0, 1] along the trace. Each sine is a
+    unit phasor turned by a constant complex step, and the damping one real factor, so a
+    point costs four complex multiplies instead of four sines and an exponential."""
+    t_end = p["t_end"]
+    a1 = 1.0 / (1.0 + p["amp2"])
+    a2 = p["amp2"] / (1.0 + p["amp2"])
+    dt = t_end / (n - 1)
+    zx1 = complex(math.cos(p["px1"]), math.sin(p["px1"]))
+    zy1 = complex(math.cos(p["py1"]), math.sin(p["py1"]))
+    zx2 = complex(math.cos(p["px2"]), math.sin(p["px2"]))
+    zy2 = complex(math.cos(p["py2"]), math.sin(p["py2"]))
+    sx1 = complex(math.cos(p["fx1"] * dt), math.sin(p["fx1"] * dt))
+    sy1 = complex(math.cos(p["fy1"] * dt), math.sin(p["fy1"] * dt))
+    sx2 = complex(math.cos(p["fx2"] * dt), math.sin(p["fx2"] * dt))
+    sy2 = complex(math.cos(p["fy2"] * dt), math.sin(p["fy2"] * dt))
+    e = 1.0
+    de = math.exp(-p["damp"] * dt)
+    du = 1.0 / (n - 1)
+    pts = []
+    append = pts.append
+    for i in range(n):
+        append((e * (a1 * zx1.imag + a2 * zx2.imag), e * (a1 * zy1.imag + a2 * zy2.imag), i * du))
+        zx1 *= sx1; zy1 *= sy1; zx2 *= sx2; zy2 *= sy2
+        e *= de
+    return pts
+
+
+# ---------------------------------------------------------------- render
+
+def hsv_to_rgb(h, s, v):
+    h = (h % 360.0) / 60.0
+    i = int(h)
+    f = h - i
+    p = v * (1 - s)
+    q = v * (1 - s * f)
+    t = v * (1 - s * (1 - f))
+    r, g, b = [(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)][i % 6]
+    return int(r * 255 + 0.5), int(g * 255 + 0.5), int(b * 255 + 0.5)
+
+
+BITS = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]
+
+
+def render(pts, cols, rows, p):
+    """Braille cells, each coloured by the mean position along the trace of its dots."""
+    w, h = cols * 2, rows * 4
+    cells = [[0] * cols for _ in range(rows)]
+    usum = [[0.0] * cols for _ in range(rows)]
+    ucnt = [[0] * cols for _ in range(rows)]
+    for x, y, u in pts:
+        dx = int((x * 0.5 + 0.5) * (w - 1) + 0.5)
+        dy = int((0.5 - y * 0.5) * (h - 1) + 0.5)
+        cx, cy = dx // 2, dy // 4
+        cells[cy][cx] |= BITS[dy % 4][dx % 2]
+        usum[cy][cx] += u
+        ucnt[cy][cx] += 1
+    lines = []
+    for cy in range(rows):
+        out = []
+        last = None
+        for cx in range(cols):
+            m = cells[cy][cx]
+            if not m:
+                if last is not None:
+                    out.append("\x1b[0m")
+                    last = None
+                out.append(" ")
+                continue
+            u = usum[cy][cx] / ucnt[cy][cx]
+            rgb = hsv_to_rgb(p["base_hue"] + p["sweep"] * u, 0.85, 0.55 + 0.45 * (1 - u))
+            code = "\x1b[38;2;%d;%d;%dm" % rgb
+            if code != last:
+                out.append(code)
+                last = code
+            out.append(chr(0x2800 + m))
+        if last is not None:
+            out.append("\x1b[0m")
+        lines.append("".join(out))
+    return lines
+
+
+def write_png(path, w, h, raw, palette):
+    """An 8-bit palette PNG: `raw` is h rows of (filter byte + w indices), `palette` the
+    256 RGB triples. One byte a pixel and a fast deflate: the image is mostly black."""
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 3, 0, 0, 0))
+           + chunk(b"PLTE", palette) + chunk(b"IDAT", zlib.compress(bytes(raw), 1)) + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def render_png(pts, p, path, w=1200, h=600, dot=3):
+    """The trace as coloured dots on black, the look of the Braille drawing at pixel scale.
+    Index 0 is black; 1..255 is the colour along the trace, so each dot is one slice write."""
+    palette = bytearray(3)
+    for k in range(1, 256):
+        u = (k - 1) / 254.0
+        palette += bytes(hsv_to_rgb(p["base_hue"] + p["sweep"] * u, 0.85, 0.6 + 0.4 * (1 - u)))
+    stride = w + 1                                   # one filter byte (0) leads each row
+    buf = bytearray(stride * h)
+    marks = [bytes([k]) * dot for k in range(256)]
+    xs = w - 1 - dot
+    ys = h - 1 - dot
+    for x, y, u in pts:
+        px = int((x * 0.5 + 0.5) * xs + 0.5)
+        py = int((0.5 - y * 0.5) * ys + 0.5)
+        mark = marks[1 + int(u * 254)]
+        base = py * stride + 1 + px
+        for dy in range(dot):
+            i = base + dy * stride
+            buf[i:i + dot] = mark
+    write_png(path, w, h, buf, bytes(palette))
+
+
+# ---------------------------------------------------------------- the terminal
+
+DEBUG = bool(os.environ.get("HEALTH_DEBUG"))
+DA1 = rb"\x1b\[\?[0-9;]*c"
+
+
+def winsize():
+    """(rows, cols, xpix, ypix) of the controlling terminal."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+        try:
+            rows, cols, xpix, ypix = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+        finally:
+            os.close(fd)
+        if rows and cols:
+            return rows, cols, xpix, ypix
+        return 24, 80, 0, 0
+    except OSError:
+        try:
+            ts = os.get_terminal_size()
+            return ts.lines, ts.columns, 0, 0
+        except OSError:
+            return 24, 80, 0, 0
+
+
+def ask(query, timeout=0.6):
+    """Send `query` plus DA1 to the terminal; return everything read up to the DA1 reply."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return b""
+    buf = b""
+    try:
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            os.write(fd, query + b"\x1b[c")
+            deadline = time.monotonic() + timeout
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                r, _, _ = select.select([fd], [], [], left)
+                if not r:
+                    break
+                buf += os.read(fd, 256)
+                if re.search(DA1, buf):
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, old)
+    except (termios.error, OSError):
+        pass
+    finally:
+        os.close(fd)
+    if DEBUG:
+        sys.stderr.write("health: asked %r, got %r\n" % (query, buf))
+    return buf
+
+
+def probe():
+    """(kitty_ok, sixel_ok) from the terminal, or (False, False) when it cannot be asked."""
+    buf = ask(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\")
+    kitty = b"_Gi=31;OK" in buf
+    m = re.search(rb"\x1b\[\?([0-9;]*)c", buf)
+    sixel = bool(m) and "4" in m.group(1).decode().split(";")
+    return kitty, sixel
+
+
+def have(cmd):
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if os.access(os.path.join(d, cmd), os.X_OK):
+            return os.path.join(d, cmd)
+    return None
+
+
+def choose_format():
+    """kitty, iterm, sixels (needs chafa) or None, from the environment first (an ssh
+    client forwarding TERM_PROGRAM / WT_SESSION), then by asking the terminal; tmux
+    swallows the query, hence the environment first."""
+    forced = os.environ.get("HEALTH_FORMAT")
+    if forced:
+        return forced if forced in ("kitty", "iterm", "sixels") else None
+    if not sys.stdout.isatty():
+        return None
+    env = os.environ
+    prog = env.get("TERM_PROGRAM", "")
+    name = prog + ":" + env.get("LC_TERMINAL", "")
+    term = env.get("TERM", "")
+    if env.get("WT_SESSION"):
+        return "sixels" if have("chafa") else None
+    if prog in ("ghostty", "WezTerm", "tmux") or "kitty" in term or "ghostty" in term:
+        return "kitty"
+    if "iTerm" in name:
+        return "iterm"
+    kitty, sixel = probe()
+    if kitty:
+        return "kitty"
+    if sixel and have("chafa"):
+        return "sixels"
+    return None
+
+
+def tmux_wrap(seq):
+    return b"\x1bPtmux;" + seq.replace(b"\x1b", b"\x1b\x1b") + b"\x1b\\"
+
+
+# the Unicode placeholder diacritics of the Kitty protocol (row and column marks)
+DIACRITICS = [773, 781, 782, 784, 786, 829, 830, 831, 838, 842, 843, 844, 848, 849, 850, 855, 859, 867, 868, 869, 870, 871, 872, 873, 874, 875, 876, 877, 878, 879, 1155, 1156, 1157, 1158, 1159, 1426, 1427, 1428, 1429, 1431, 1432, 1433, 1436, 1437, 1438, 1439, 1440, 1441, 1448, 1449, 1451, 1452, 1455, 1476, 1552, 1553, 1554, 1555, 1556, 1557, 1558, 1559, 1623, 1624, 1625, 1626, 1627, 1629, 1630, 1750, 1751, 1752, 1753, 1754, 1755, 1756, 1759, 1760, 1761, 1762, 1764, 1767, 1768, 1771, 1772, 1840, 1842, 1843, 1845, 1846, 1850, 1853, 1855, 1856, 1857, 1859, 1861, 1863, 1865, 1866, 2027, 2028, 2029, 2030, 2031, 2032, 2033, 2035, 2070, 2071, 2072, 2073, 2075, 2076, 2077, 2078, 2079, 2080, 2081, 2082, 2083, 2085, 2086, 2087, 2089, 2090, 2091, 2092, 2093, 2385, 2387, 2388, 3970, 3971, 3974, 3975, 4957, 4958, 4959, 6109, 6458, 6679, 6773, 6774, 6775, 6776, 6777, 6778, 6779, 6780, 7019, 7021, 7022, 7023, 7024, 7025, 7026, 7027, 7376, 7377, 7378, 7386, 7387, 7392, 7616, 7617, 7619, 7620, 7621, 7622, 7623, 7624, 7625, 7627, 7628, 7633, 7634, 7635, 7636, 7637, 7638, 7639, 7640, 7641, 7642, 7643, 7644, 7645, 7646, 7647, 7648, 7649, 7650, 7651, 7652, 7653, 7654, 7678, 8400, 8401, 8404, 8405, 8406, 8407, 8411, 8412, 8417, 8423, 8425, 8432, 11503, 11504, 11505, 11744, 11745, 11746, 11747, 11748, 11749, 11750, 11751, 11752, 11753, 11754, 11755, 11756, 11757, 11758, 11759, 11760, 11761, 11762, 11763, 11764, 11765, 11766, 11767, 11768, 11769, 11770, 11771, 11772, 11773, 11774, 11775, 42607, 42620, 42621, 42736, 42737, 43232, 43233, 43234, 43235, 43236, 43237, 43238, 43239, 43240, 43241, 43242, 43243, 43244, 43245, 43246, 43247, 43248, 43249, 43696, 43698, 43699, 43703, 43704, 43710, 43711, 43713, 65056, 65057, 65058, 65059, 65060, 65061, 65062, 68111, 68152, 119173, 119174, 119175, 119176, 119177, 119210, 119211, 119212, 119213, 119362, 119363, 119364]
+
+
+def kitty_png(path, in_tmux, box, image_id):
+    """Send the PNG over the Kitty graphics protocol, fitted to `box` = (cols, rows) with
+    its aspect kept, as image `image_id`, placed with Unicode placeholders so that tmux
+    and the terminal own it like text (WezTerm, which does not place placeholders, gets
+    a direct placement). The PNG itself goes over (f=100): about 100 KB a frame."""
+    rows, cols, xpix, ypix = winsize()
+    with open(path, "rb") as f:
+        head = f.read(24)
+        f.seek(0)
+        data = base64.b64encode(f.read())
+    w, h = struct.unpack(">II", head[16:24])
+    cell_w = xpix / cols if xpix and cols else 10.0
+    cell_h = ypix / rows if ypix and rows else 20.0
+    box_c, box_r = min(box[0], cols), min(box[1], rows)
+    scale = min(box_c * cell_w / w, box_r * cell_h / h)
+    c = max(1, min(box_c, round(w * scale / cell_w)))
+    r = max(1, min(box_r, round(h * scale / cell_h)))
+    chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+    seqs = []
+    placeholders = in_tmux or os.environ.get("TERM_PROGRAM", "") != "WezTerm"
+    for i, chunk in enumerate(chunks):
+        ctrl = b"m=%d" % (0 if i == len(chunks) - 1 else 1)
+        if i == 0:
+            if placeholders:
+                ctrl = b"a=T,U=1,i=%d,f=100,q=2,c=%d,r=%d," % (image_id, c, r) + ctrl
+            else:
+                ctrl = b"a=T,i=%d,f=100,q=2,C=1,c=%d,r=%d," % (image_id, c, r) + ctrl
+        seqs.append(b"\x1b_G" + ctrl + b";" + chunk + b"\x1b\\")
+    if placeholders:
+        c = min(c, cols - 1, len(DIACRITICS))
+        r = min(r, len(DIACRITICS))
+        rows_out = []
+        for row in range(r):
+            cells = "".join(chr(0x10EEEE) + chr(DIACRITICS[row]) + chr(DIACRITICS[col]) for col in range(c))
+            rows_out.append(("\x1b[38;5;%dm" % image_id) + cells + "\x1b[39m")
+        out = b"".join(tmux_wrap(q) if in_tmux else q for q in seqs) + ("\r\n".join(rows_out) + "\r\n").encode()
+    else:
+        out = b"".join(seqs)
+    if DEBUG:
+        sys.stderr.write("health: kitty png %dx%d px -> %dx%d cells (cell %.1fx%.1f px, tmux=%s, placeholders=%s, %d bytes)\n"
+                         % (w, h, c, r, cell_w, cell_h, in_tmux, placeholders, len(out)))
+    sys.stdout.buffer.write(out)
+    sys.stdout.flush()
+    return True
+
+
+def iterm_png(path, box):
+    """Send the PNG over the iTerm2 inline-image protocol, fitted to `box` = (cols, rows)."""
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read())
+    seq = b"\x1b]1337;File=inline=1;width=%d;height=%d;preserveAspectRatio=1:" % box + data + b"\x07"
+    sys.stdout.buffer.write(seq)
+    sys.stdout.flush()
+    return True
+
+
+def set_pixel_size():
+    """For sixel: learn the window's pixel size from the terminal and store it in the pty
+    (Windows OpenSSH reports a console size that does not follow the window)."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return
+    try:
+        rows, cols, xpix, ypix = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+        xpix = ypix = 0
+        buf = ask(b"\x1b[14t\x1b[16t")
+        m = re.search(rb"\x1b\[4;(\d+);(\d+)t", buf)        # text area: height ; width
+        if m:
+            ypix, xpix = int(m.group(1)), int(m.group(2))
+        else:
+            m = re.search(rb"\x1b\[6;(\d+);(\d+)t", buf)    # one cell: height ; width
+            if m:
+                ypix, xpix = int(m.group(1)) * rows, int(m.group(2)) * cols
+        if xpix and ypix:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, xpix, ypix))
+    except (OSError, struct.error):
+        pass
+    finally:
+        os.close(fd)
+
+
+class Keys:
+    """The controlling terminal in cbreak mode for the whole live view (set once, not per
+    frame: a key that arrives between two frames while the terminal is back in canonical
+    mode would wait for a newline on Linux), restored on close."""
+
+    def __init__(self):
+        self.fd = None
+        self.old = None
+        try:
+            self.fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+            self.old = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        except (termios.error, OSError):
+            if self.fd is not None:
+                os.close(self.fd)
+            self.fd = None
+
+    def wait(self, seconds):
+        """Wait, or return early with the key pressed (bytes)."""
+        if self.fd is None:
+            time.sleep(seconds)
+            return b""
+        r, _, _ = select.select([self.fd], [], [], seconds)
+        return os.read(self.fd, 16) if r else b""
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSANOW, self.old)
+            except termios.error:
+                pass
+            os.close(self.fd)
+            self.fd = None
+
+
+MUTED = "\x1b[38;2;90;90;100m"
+DIM = "\x1b[38;2;150;150;160m"
+BOLD = "\x1b[1;97m"
+RESET = "\x1b[0m"
+
+
+def status_line(raw, fa, fb):
+    return ("%.0f°C   load %.2f   %d / %d MB   %.0f GB free   %s:%s   q quits"
+            % (raw["temp"], raw["load"], raw["mem_used"], raw["mem_total"], raw["disk_free_gb"], fa, fb))
+
+
+# ---------------------------------------------------------------- the live view
+
+TAU = {"temp": 3.0, "mem_used": 3.0, "load": 2.0, "fa": 20.0, "fb": 20.0}
+
+
+class Eased:
+    """Each reading eases toward the sensor with a time constant, so the sensor's noise
+    (a cpu sensor flickers over 3 C from frame to frame) never reaches the figure and a
+    real change arrives over a few seconds, the way a machine warms and cools."""
+
+    def __init__(self):
+        self.v = {}
+
+    def __call__(self, key, x, dt):
+        v = self.v.get(key, x)
+        v += (x - v) * (1.0 - math.exp(-dt / TAU[key]))
+        self.v[key] = v
+        return v
+
+
+def frame_params(raw, ease, dt, now):
+    """The curve's parameters for one live frame: eased readings, the phase on seconds."""
+    r = dict(raw)
+    for key in ("temp", "mem_used", "load"):
+        r[key] = ease(key, raw[key], dt)
+    fa, fb = RATIOS[(raw["hour"] // 4) % len(RATIOS)]
+    p = params(r, (ease("fa", fa, dt), ease("fb", fb, dt)))
+    up_s = r["uptime"]
+    p["px1"] = math.radians((up_s * 6.0) % 360) + (p["px1"] - math.radians((up_s / 60.0) % 360))
+    p["px2"] = 2 * math.pi * (now % 60) / 60.0
+    p["py2"] = p["px2"] + math.pi / 2
+    return p, fa, fb
+
+
+def live(fps=10.0, braille=False, source=gather):
+    """The figure alone, as large as the window, redrawn from fresh readings about `fps`
+    times a second on the alternate screen until q."""
+    fmt = None if braille else choose_format()
+    if fmt == "sixels":
+        set_pixel_size()
+    rows, cols, xpix, ypix = winsize()
+    cell_w = xpix / cols if xpix and cols else 10.0
+    cell_h = ypix / rows if ypix and rows else 20.0
+    box_c, box_r = cols, rows - 1                      # one row for the readings
+    w = int(min(1600, box_c * cell_w, box_r * cell_h * 2))     # the frame: 2:1, as large as the box
+    w = max(200, w - w % 2)
+    h = w // 2
+    in_tmux = os.environ.get("TERM_PROGRAM") == "tmux" or bool(os.environ.get("TMUX"))
+    path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "health-%d.png" % os.getpid())
+
+    def apc(seq):
+        if in_tmux:
+            seq = tmux_wrap(seq)
+        os.write(sys.stdout.fileno(), seq)
+
+    out = sys.stdout
+    out.write("\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J")
+    out.flush()
+    shown = None
+    next_frame = time.monotonic()
+    ease = Eased()
+    last = time.monotonic()
+    keys = Keys()
+    try:
+        while True:
+            next_frame += 1.0 / fps                  # a fixed beat, so the turn is even
+            now_m = time.monotonic()
+            dt = min(1.0, max(0.0, now_m - last))
+            last = now_m
+            raw = source()
+            p, fa, fb = frame_params(raw, ease, dt, time.time())
+            pts = trace(p, n=12000)
+            out.write("\x1b[H")
+            out.flush()
+            if fmt == "kitty":
+                render_png(pts, p, path, w, h, dot=3)
+                new_id = 1 if shown != 1 else 2
+                if kitty_png(path, in_tmux, (box_c, box_r), new_id):
+                    if shown:
+                        apc(b"\x1b_Ga=d,d=I,i=%d\x1b\\" % shown)
+                    shown = new_id
+            elif fmt == "iterm":
+                render_png(pts, p, path, w, h, dot=3)
+                iterm_png(path, (box_c, box_r))
+            elif fmt == "sixels":
+                render_png(pts, p, path, w, h, dot=3)
+                subprocess.run(["chafa", "--format=sixels", "--size=%dx%d" % (box_c, box_r), path])
+            else:
+                fig = render(pts, max(20, cols - 2), max(5, box_r - 1), p)
+                out.write("\n".join(" " + line for line in fig) + "\n")
+            status = status_line(raw, fa, fb)
+            out.write("\x1b[%d;1H\x1b[2K%s %s%s" % (rows, MUTED, status[:cols - 2], RESET))
+            out.flush()
+            key = keys.wait(max(0.005, next_frame - time.monotonic()))
+            if time.monotonic() > next_frame + 1.0 / fps:
+                next_frame = time.monotonic()        # fell behind (a slow link): do not race to catch up
+            if key and key.lower().startswith((b"q", b"\x03", b"\x1b")):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        keys.close()
+        if fmt == "kitty":
+            apc(b"\x1b_Ga=d,d=A\x1b\\")
+        out.write("\x1b[?25h\x1b[?1049l")
+        out.flush()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- one drawing
+
+def legend(r):
+    up = int(r["uptime"])
+    d, h, m = up // 86400, up % 86400 // 3600, up % 3600 // 60
+    upstr = "%dd %dh %dm" % (d, h, m) if d else "%dh %dm" % (h, m)
+    W = 46
+    rule = MUTED + "─" * W + RESET
+
+    def kv(label, value, lw=8, vw=None):
+        s = "%s%s%s%s" % (MUTED, label.ljust(lw), RESET, value)
+        if vw is not None:
+            s += " " * max(0, vw - len(value))
+        return s
+
+    who = "%s@%s" % (r["user"], r["host"])
+    head = ("%s%s%s%s@%s%s%s%s" % (BOLD, r["user"], RESET, MUTED, RESET, BOLD, r["host"], RESET)
+            + " " * max(2, W - len(who) - len(r["stamp"])) + DIM + r["stamp"] + RESET)
+    col = 18
+    return [
+        head,
+        rule,
+        kv("uptime", upstr, vw=col) + kv("ip", r["ip"]),
+        kv("cpu", "%.0f°C" % r["temp"], vw=col) + kv("load", "%.2f" % r["load"]),
+        kv("memory", "%d / %d MB" % (r["mem_used"], r["mem_total"]), vw=col)
+        + kv("disk", "%.0f GB free" % r["disk_free_gb"]),
+        kv("kernel", r["kernel"]),
+    ]
+
+
+def once(cols, show_legend, braille, source=gather):
+    """One Braille drawing from the readings now, with the legend beside it. This is the
+    login-screen form: no animation, no pixels, done in well under a tenth of a second."""
+    r = source()
+    p = params(r)
+    leg = legend(r) if show_legend else []
+    legend_w = 50 if show_legend else 0
+    rows = 16
+    avail = cols - legend_w - 4
+    below = show_legend and avail < 32
+    if below:
+        avail = cols - 4
+    cw = max(24, min(2 * rows + 8, avail))
+    fig = render(trace(p), cw, rows, p)
+    out = [""]
+    if below:
+        out += ["  " + line for line in fig] + [""] + ["  " + line for line in leg]
+    else:
+        pad = (len(fig) - len(leg)) // 2
+        for i, line in enumerate(fig):
+            j = i - pad
+            out.append("  " + line + "   " + (leg[j] if 0 <= j < len(leg) else ""))
+    out.append("")
+    sys.stdout.write("\n".join(out) + "\n")
+
+
+# ---------------------------------------------------------------- figures and the demo
+
+def fake_source(overrides):
+    """Readings now, with some replaced (temp=73,load=4.7,mem=0.4,disk=0.8,hour=14)."""
+    def source():
+        r = gather()
+        for k, v in overrides.items():
+            if k == "mem":
+                r["mem_used"] = int(v * r["mem_total"])
+            elif k == "disk":
+                r["disk_free_frac"] = 1.0 - v
+            elif k in ("hour", "sec"):
+                r[k] = int(v)
+            elif k == "user":
+                r["user"] = v
+            elif k == "host":
+                r["host"] = v
+            else:
+                r[k] = float(v)
+        return r
+    return source
+
+
+def parse_readings(spec):
+    out = {}
+    for item in spec.split(","):
+        if not item:
+            continue
+        k, _, v = item.partition("=")
+        out[k.strip()] = v.strip() if k.strip() in ("user", "host") else float(v)
+    return out
+
+
+def png_once(path, source, w, h):
+    """One frame to a PNG, the live view's form (phase on seconds), from `source`."""
+    raw = source()
+    p, fa, fb = frame_params(raw, Eased(), 0.0, time.time())
+    render_png(trace(p, n=12000), p, path, w, h, dot=max(2, w // 400))
+    return status_line(raw, fa, fb)
+
+
+SCENARIO = [    # (seconds, temp, load per core, mem fraction): a build starts, runs, and the machine cools
+    (0.0, 42, 0.05, 0.12), (2.0, 42, 0.05, 0.12), (3.0, 48, 0.8, 0.3), (5.0, 60, 1.0, 0.5),
+    (8.0, 73, 1.0, 0.6), (11.0, 75, 1.0, 0.6), (12.0, 66, 0.3, 0.3), (15.0, 50, 0.05, 0.12), (18.0, 42, 0.05, 0.12),
+]
+
+
+def scenario_at(t):
+    for (t0, a0, b0, c0), (t1, a1, b1, c1) in zip(SCENARIO, SCENARIO[1:]):
+        if t0 <= t <= t1:
+            u = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            return a0 + (a1 - a0) * u, b0 + (b1 - b0) * u, c0 + (c1 - c0) * u
+    return SCENARIO[-1][1:]
+
+
+def demo(outdir, fps, w, h, seconds=None):
+    """Frames of a scripted scenario (a build starts and the machine cools) through the
+    live view's own frame maker, with the eased readings and the turning phase, so a GIF
+    of the real renderer can be made without waiting for a real build. Readings other
+    than temperature, load and memory are the machine's own."""
+    os.makedirs(outdir, exist_ok=True)
+    ease = Eased()
+    cores = os.cpu_count() or 1
+    total = seconds if seconds is not None else SCENARIO[-1][0]
+    n = int(total * fps)
+    t0 = time.time()
+    base = gather()
+    base["disk_free_frac"] = 0.35
+    for i in range(n):
+        t = i / fps
+        temp, busy, mem = scenario_at(t)
+        raw = dict(base)
+        raw["temp"], raw["load"], raw["mem_used"] = temp, busy * cores, int(mem * raw["mem_total"])
+        raw["uptime"] = base["uptime"] + t
+        p, fa, fb = frame_params(raw, ease, 1.0 / fps, t0 + t)
+        render_png(trace(p, n=12000), p, os.path.join(outdir, "frame-%04d.png" % i), w, h, dot=max(2, w // 400))
+        with open(os.path.join(outdir, "frame-%04d.txt" % i), "w") as f:
+            f.write(status_line(raw, fa, fb).replace("   q quits", "") + "\n")
+    return n
+
+
+# ---------------------------------------------------------------- main
+
+USAGE = """usage: health [FPS] [--braille]      the figure alone, as large as the window, turning
+                                     continuously and redrawn from fresh readings about FPS
+                                     times a second (default 10, 0.5 to 20); q quits
+       health --once [--no-legend]   one Braille drawing with the readings beside it (a
+                                     login screen: instant, no pixels, no animation)
+       health --png PATH [--size WxH] [--readings temp=73,load=4.7,mem=0.6,disk=0.8,hour=14]
+                                     one frame to a PNG, from the readings now or as given
+       health --demo DIR [--fps N] [--size WxH]
+                                     frames of a scripted build (frame-NNNN.png + .txt)
+       health -h | --help | --version
+  --braille draws dots instead of pixels; HEALTH_FORMAT=kitty|iterm|sixels forces a protocol;
+  HEALTH_DEBUG=1 logs the terminal's replies on stderr. man health for the full page."""
+
+
+def main(argv):
+    args = list(argv[1:])
+    fps = 10.0
+    braille = once_mode = show_legend = None
+    show_legend = True
+    png = demo_dir = None
+    size = (1200, 600)
+    readings = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print(USAGE)
+            return 0
+        elif a == "--version":
+            print("health " + VERSION)
+            return 0
+        elif a == "--braille":
+            braille = True
+        elif a == "--once":
+            once_mode = True
+        elif a == "--no-legend":
+            show_legend = False
+        elif a in ("--png", "--demo", "--size", "--readings", "--fps", "--seconds", "--cols"):
+            i += 1
+            if i >= len(args):
+                sys.stderr.write("health: %s needs a value\n" % a)
+                return 2
+            v = args[i]
+            if a == "--png":
+                png = v
+            elif a == "--demo":
+                demo_dir = v
+            elif a == "--size":
+                size = tuple(int(x) for x in v.lower().split("x"))
+            elif a == "--readings":
+                readings = parse_readings(v)
+            elif a == "--fps":
+                fps = float(v)
+            elif a == "--seconds":
+                readings["_seconds"] = float(v)
+            elif a == "--cols":
+                readings["_cols"] = int(v)
+        elif a.startswith("-"):
+            sys.stderr.write("health: unknown option %s\n%s\n" % (a, USAGE))
+            return 2
+        else:
+            try:
+                fps = min(20.0, max(0.5, float(a)))
+            except ValueError:
+                sys.stderr.write("health: FPS must be a number, not %r\n" % a)
+                return 2
+        i += 1
+    seconds = readings.pop("_seconds", None)
+    cols = readings.pop("_cols", None)
+    source = fake_source(readings) if readings else gather
+    if demo_dir:
+        n = demo(demo_dir, fps, size[0], size[1], seconds)
+        print("health: %d frames in %s" % (n, demo_dir))
+        return 0
+    if png:
+        print(png_once(png, source, size[0], size[1]))
+        return 0
+    if once_mode:
+        if cols is None:
+            try:
+                cols = os.get_terminal_size().columns
+            except OSError:
+                cols = 80
+            if cols < 20:
+                cols = 80
+        once(cols, show_legend, braille, source)
+        return 0
+    live(fps, bool(braille), source)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
