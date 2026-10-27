@@ -61,7 +61,7 @@ import time
 import tty
 import zlib
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # ---------------------------------------------------------------- readings
 
@@ -452,6 +452,25 @@ def tmux_wrap(seq):
 DIACRITICS = [773, 781, 782, 784, 786, 829, 830, 831, 838, 842, 843, 844, 848, 849, 850, 855, 859, 867, 868, 869, 870, 871, 872, 873, 874, 875, 876, 877, 878, 879, 1155, 1156, 1157, 1158, 1159, 1426, 1427, 1428, 1429, 1431, 1432, 1433, 1436, 1437, 1438, 1439, 1440, 1441, 1448, 1449, 1451, 1452, 1455, 1476, 1552, 1553, 1554, 1555, 1556, 1557, 1558, 1559, 1623, 1624, 1625, 1626, 1627, 1629, 1630, 1750, 1751, 1752, 1753, 1754, 1755, 1756, 1759, 1760, 1761, 1762, 1764, 1767, 1768, 1771, 1772, 1840, 1842, 1843, 1845, 1846, 1850, 1853, 1855, 1856, 1857, 1859, 1861, 1863, 1865, 1866, 2027, 2028, 2029, 2030, 2031, 2032, 2033, 2035, 2070, 2071, 2072, 2073, 2075, 2076, 2077, 2078, 2079, 2080, 2081, 2082, 2083, 2085, 2086, 2087, 2089, 2090, 2091, 2092, 2093, 2385, 2387, 2388, 3970, 3971, 3974, 3975, 4957, 4958, 4959, 6109, 6458, 6679, 6773, 6774, 6775, 6776, 6777, 6778, 6779, 6780, 7019, 7021, 7022, 7023, 7024, 7025, 7026, 7027, 7376, 7377, 7378, 7386, 7387, 7392, 7616, 7617, 7619, 7620, 7621, 7622, 7623, 7624, 7625, 7627, 7628, 7633, 7634, 7635, 7636, 7637, 7638, 7639, 7640, 7641, 7642, 7643, 7644, 7645, 7646, 7647, 7648, 7649, 7650, 7651, 7652, 7653, 7654, 7678, 8400, 8401, 8404, 8405, 8406, 8407, 8411, 8412, 8417, 8423, 8425, 8432, 11503, 11504, 11505, 11744, 11745, 11746, 11747, 11748, 11749, 11750, 11751, 11752, 11753, 11754, 11755, 11756, 11757, 11758, 11759, 11760, 11761, 11762, 11763, 11764, 11765, 11766, 11767, 11768, 11769, 11770, 11771, 11772, 11773, 11774, 11775, 42607, 42620, 42621, 42736, 42737, 43232, 43233, 43234, 43235, 43236, 43237, 43238, 43239, 43240, 43241, 43242, 43243, 43244, 43245, 43246, 43247, 43248, 43249, 43696, 43698, 43699, 43703, 43704, 43710, 43711, 43713, 65056, 65057, 65058, 65059, 65060, 65061, 65062, 68111, 68152, 119173, 119174, 119175, 119176, 119177, 119210, 119211, 119212, 119213, 119362, 119363, 119364]
 
 
+def image_ids():
+    """Two Kitty image ids of this process's own, from the host and the pid, so two views
+    sharing one terminal (two ssh panes in one window) never paint each other's picture:
+    the placeholder's id is terminal wide, and the first version's fixed 1 and 2 collided."""
+    import socket
+    import zlib
+    seed = ("%s:%d" % (socket.gethostname(), os.getpid())).encode()
+    base = 256 + (zlib.crc32(seed) & 0x7FFFFE)        # 24-bit ids, even base, never 1 or 2
+    return base, base + 1
+
+
+def id_colour(image_id):
+    """The placeholder foreground that names the image: 8-bit for ids below 256, else the
+    id's three bytes as a 24-bit colour."""
+    if image_id < 256:
+        return "\x1b[38;5;%dm" % image_id
+    return "\x1b[38;2;%d;%d;%dm" % ((image_id >> 16) & 255, (image_id >> 8) & 255, image_id & 255)
+
+
 def kitty_png(path, in_tmux, box, image_id, indent=0):
     """Send the PNG over the Kitty graphics protocol, fitted to `box` = (cols, rows) with
     its aspect kept, as image `image_id`, placed with Unicode placeholders so that tmux
@@ -486,7 +505,7 @@ def kitty_png(path, in_tmux, box, image_id, indent=0):
         rows_out = []
         for row in range(r):
             cells = "".join(chr(0x10EEEE) + chr(DIACRITICS[row]) + chr(DIACRITICS[col]) for col in range(c))
-            rows_out.append(" " * indent + ("\x1b[38;5;%dm" % image_id) + cells + "\x1b[39m")
+            rows_out.append(" " * indent + id_colour(image_id) + cells + "\x1b[39m")
         out = b"".join(tmux_wrap(q) if in_tmux else q for q in seqs) + ("\r\n".join(rows_out) + "\r\n").encode()
     else:
         out = b"".join(seqs)
@@ -639,6 +658,7 @@ def live(fps=10.0, braille=False, source=gather):
     out.write("\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J")
     out.flush()
     shown = None
+    id_a, id_b = image_ids()
     next_frame = time.monotonic()
     ease = Eased()
     last = time.monotonic()
@@ -656,7 +676,7 @@ def live(fps=10.0, braille=False, source=gather):
             out.flush()
             if fmt == "kitty":
                 render_png(pts, p, path, w, h, dot=3)
-                new_id = 1 if shown != 1 else 2
+                new_id = id_a if shown != id_a else id_b
                 if kitty_png(path, in_tmux, (box_c, box_r), new_id):
                     if shown:
                         apc(b"\x1b_Ga=d,d=I,i=%d\x1b\\" % shown)
@@ -683,7 +703,8 @@ def live(fps=10.0, braille=False, source=gather):
     finally:
         keys.close()
         if fmt == "kitty":
-            apc(b"\x1b_Ga=d,d=A\x1b\\")
+            for i in (id_a, id_b):                   # only this view's own images
+                apc(b"\x1b_Ga=d,d=I,i=%d\x1b\\" % i)
         out.write("\x1b[?25h\x1b[?1049l")
         out.flush()
         try:
@@ -743,9 +764,9 @@ def once_pixels(r, fmt, cols, rows, leg, indent=2):
         sys.stdout.write("\n")
         sys.stdout.flush()
         if fmt == "kitty":
-            # an id of its own per login (the live view uses 1 and 2), so an earlier
-            # drawing in the scrollback keeps its picture
-            kitty_png(path, in_tmux, (box_c, box_r), 16 + os.getpid() % 200, indent)
+            # an id of its own per login, so an earlier drawing in the scrollback and a
+            # view in another pane keep their pictures
+            kitty_png(path, in_tmux, (box_c, box_r), image_ids()[0], indent)
         elif fmt == "iterm":
             sys.stdout.write(" " * indent)
             sys.stdout.flush()
