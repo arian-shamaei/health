@@ -79,7 +79,7 @@ health --demo DIR frames of a scripted build, for a GIF of the renderer
 
 On a terminal that draws pixels the frame is a PNG, rendered in pure Python and sent over the Kitty graphics protocol (Ghostty, kitty, WezTerm, also through tmux with `allow-passthrough on`), the iTerm2 inline-image protocol, or as sixels through [`chafa`](https://hpjansson.org/chafa/) when it is installed (Windows Terminal, foot, mlterm). Anywhere else the trace is Braille dots in 24-bit colour. `HEALTH_FORMAT=kitty|iterm|sixels` forces a protocol; `HEALTH_DEBUG=1` logs what the terminal answered.
 
-A frame costs a Raspberry Pi 5 about 30 ms (the trace turns unit phasors by a constant complex step instead of calling four sines a point; the PNG is one byte a pixel, deflate level 1), so ten frames a second is about a third of one core. The figure shows that too, as a little damping.
+Each view names its Kitty image after its host and pid, so two views in two panes of one window (two machines over ssh, say) keep their own pictures; through tmux, two views at ten frames a second is about two megabytes a second of passthrough, so `health 4` in each is kinder. A frame costs a Raspberry Pi 5 about 30 ms (the trace turns unit phasors by a constant complex step instead of calling four sines a point; the PNG is one byte a pixel, deflate level 1), so ten frames a second is about a third of one core. The figure shows that too, as a little damping.
 
 ### As a login screen
 
