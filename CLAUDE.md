@@ -9,7 +9,8 @@ a live harmonograph in the terminal. Public repo: https://github.com/arian-shama
 - `health.1` is the man page; `install.sh` the curl installer; `docs/render.sh` regenerates
   `docs/assets/` from the tool (the hero is a real screenshot, kept as is).
 - Origin: `~/Developer/cat/pi/rawr/harmonograph.py` on the Raspberry Pi account `rawr`.
-  This repo is the standalone form; the Pi's login screen still runs the original.
+  This repo is the standalone form; since 2026-10-27 the Pi's login screen runs this
+  version too (`health --once`, with the note printed by rawr's `.bash_profile`).
 - Rules: no dependencies, Python 3.7 syntax (the Mac's python3 is 3.9), every figure in the
   README comes from the renderer or a real screenshot, never a mock. A change to the mapping
   is a change to the docstring, the README table and the man page in the same commit.
