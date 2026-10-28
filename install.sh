@@ -5,19 +5,24 @@
 #
 # Copies the one-file program to $PREFIX/bin/health and its man page to
 # $PREFIX/share/man/man1/health.1 (PREFIX defaults to ~/.local). Python 3.7 or newer is
-# the only requirement. POSIX sh, no bashisms.
+# the only requirement. POSIX sh, no bashisms. The files come from the latest GitHub
+# release (its assets are what the README's downloads counter counts); set HEALTH_REF to
+# install a git ref straight from the repository instead.
 #
 #   HEALTH_PREFIX   install prefix (default: $HOME/.local)
-#   HEALTH_REF      git ref to install (default: main)
+#   HEALTH_REF      git ref to install instead of the latest release (for example main)
 #
 # Uninstall: rm "$PREFIX/bin/health" "$PREFIX/share/man/man1/health.1"
 
 set -eu
 
 REPO="arian-shamaei/health"
-REF="${HEALTH_REF:-main}"
 PREFIX="${HEALTH_PREFIX:-$HOME/.local}"
-RAW="https://raw.githubusercontent.com/$REPO/$REF"
+if [ -n "${HEALTH_REF:-}" ]; then
+  SRC="https://raw.githubusercontent.com/$REPO/$HEALTH_REF"
+else
+  SRC="https://github.com/$REPO/releases/latest/download"
+fi
 
 err()  { printf 'health install: error: %s\n' "$1" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -30,8 +35,8 @@ else err "curl or wget is needed"; fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-fetch "$RAW/health" "$tmp/health"
-fetch "$RAW/health.1" "$tmp/health.1"
+fetch "$SRC/health" "$tmp/health"
+fetch "$SRC/health.1" "$tmp/health.1"
 python3 -m py_compile "$tmp/health" || err "the downloaded file does not compile; try again"
 
 mkdir -p "$PREFIX/bin" "$PREFIX/share/man/man1"

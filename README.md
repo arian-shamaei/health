@@ -8,7 +8,9 @@
 
 > **▶ The idea:** two pendulums, one for X and one for Y, locked at a simple ratio, draw one closed Lissajous curve that stands still. That is the idle machine. Every reading is a *departure* from that picture, zero at idle: heat detunes the ratio and warms the hue, load damps each lap, memory adds a wobble, a full disk spreads the colour. You never read a number. You see whether the figure is calm.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/arian-shamaei/health)](https://github.com/arian-shamaei/health/releases)
+&nbsp;·&nbsp; [![Downloads](https://img.shields.io/github/downloads/arian-shamaei/health/total)](https://github.com/arian-shamaei/health/releases)
+&nbsp;·&nbsp; [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 &nbsp;·&nbsp; [![stdlib only](https://img.shields.io/badge/dependencies-none-80c850)](#install)
 &nbsp;·&nbsp; [![one file](https://img.shields.io/badge/source-one%20file-5096c8)](health)
 &nbsp;·&nbsp; [![vibe coded](https://img.shields.io/badge/AI%20usage-vibe%20coded-ff2d78)](#ai-usage)
