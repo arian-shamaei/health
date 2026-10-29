@@ -1,6 +1,6 @@
 <img src="docs/assets/title.png" alt="health: the machine's health as a Lissajous curve">
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) &nbsp;·&nbsp; [![stdlib only](https://img.shields.io/badge/dependencies-none-80c850)](#) &nbsp;·&nbsp; [![one file](https://img.shields.io/badge/source-one%20file-5096c8)](health) &nbsp;·&nbsp; [![vibe coded](https://img.shields.io/badge/AI%20usage-vibe%20coded-ff2d78)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) &nbsp;·&nbsp; [![stdlib only](https://img.shields.io/badge/dependencies-none-80c850)](#) &nbsp;·&nbsp; [![one file](https://img.shields.io/badge/source-one%20file-5096c8)](health) &nbsp;·&nbsp; [![vibe coded](https://img.shields.io/badge/AI%20usage-vibe%20coded-ff2d78)](#) &nbsp;·&nbsp; [![downloads](https://img.shields.io/github/downloads/arian-shamaei/health/total?label=downloads&color=5096c8)](https://github.com/arian-shamaei/health/releases)
 
 <img src="docs/assets/health.gif" width="1008" alt="a build starts and the machine cools: eighteen seconds of the tool">
 
